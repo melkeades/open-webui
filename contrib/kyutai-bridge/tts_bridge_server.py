@@ -22,6 +22,9 @@ import logging
 import os
 import wave
 from typing import Any, Literal
+import asyncio
+import contextlib
+import json
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -185,28 +188,30 @@ def create_app() -> FastAPI:
         Low-latency streaming over WebSocket.
 
         Protocol:
-        - Client connects and sends a JSON message: {"input"|"text": string, "voice": optional string}
+        - Client connects and sends a JSON message: {"input"|"text": string, "voice": optional string, "hold_open": optional bool}
         - Server replies with a JSON header: {"type":"ready","sample_rate":24000,"encoding":"pcm_s16le"}
         - Server streams binary frames with raw PCM S16LE mono at 24kHz as TTSAudioMessage chunks arrive
-        - On completion, server sends {"type":"eos"} JSON and closes
+        - If "hold_open": true, the client can send incremental text while the connection is open:
+            * {"type":"delta","text":"..."} or legacy {"text":"..."}
+            * {"type":"eos"} when no more text
+            * {"type":"cancel"} to abort
+          If "hold_open" is false or omitted, the server behaves as single-shot: finalize after initial text.
+        - On completion, server sends {"type":"eos"} and closes
         - On error, server sends {"type":"error","detail": str} and closes
         """
         await ws.accept()
         try:
             init_msg = await ws.receive_json()
-            text = init_msg.get("input") or init_msg.get("text")
+            text = init_msg.get("input") or init_msg.get("text") or ""
             voice = init_msg.get("voice")
-            if not text:
-                await ws.send_json(
-                    {"type": "error", "detail": "Missing 'input' (or 'text')"}
-                )
+            hold_open = bool(init_msg.get("hold_open", False))
+            if not hold_open and not text:
+                await ws.send_json({"type": "error", "detail": "Missing 'input' (or 'text')"})
                 await ws.close(code=1003)
                 return
 
             # Inform client about stream format as early as possible
-            await ws.send_json(
-                {"type": "ready", "sample_rate": SAMPLE_RATE, "encoding": "pcm_s16le"}
-            )
+            await ws.send_json({"type": "ready", "sample_rate": SAMPLE_RATE, "encoding": "pcm_s16le"})
 
             # Connect to TTS and start synthesis
             try:
@@ -238,24 +243,94 @@ def create_app() -> FastAPI:
                 return
 
             logger.info("TTS stream: starting synthesis (voice=%s)", voice)
-            await tts.send(text)
-            await tts.send(TTSClientEosMessage())
+            # Initial text (may be empty if hold_open)
+            if text:
+                await tts.send(text)
+            if not hold_open:
+                await tts.send(TTSClientEosMessage())
 
             frames = 0
+            cancel_event = asyncio.Event()
 
-            try:
-                async for msg in tts:
-                    if isinstance(msg, TTSAudioMessage):
-                        # Convert float32 [-1,1] to int16 bytes
-                        pcm = np.asarray(msg.pcm, dtype=np.float32)
-                        pcm = np.clip(pcm, -1.0, 1.0)
-                        pcm_i16 = (pcm * 32767.0).astype(np.int16)
-                        await ws.send_bytes(pcm_i16.tobytes())
-                        frames += len(pcm_i16)
-            finally:
-                await tts.shutdown()
+            async def pump_ws_to_tts() -> None:
+                if not hold_open:
+                    # In single-shot mode, only listen for disconnect/cancel to stop early
+                    try:
+                        while True:
+                            msg = await ws.receive()
+                            if msg.get("type") == "websocket.disconnect":
+                                cancel_event.set()
+                                break
+                            if "text" in msg and msg["text"]:
+                                try:
+                                    data = json.loads(msg["text"])
+                                    if data.get("type") == "cancel":
+                                        cancel_event.set()
+                                        break
+                                except Exception:
+                                    # ignore raw text during single-shot
+                                    pass
+                    except WebSocketDisconnect:
+                        cancel_event.set()
+                    return
 
-            if frames == 0:
+                # hold_open mode: accept deltas/eos/cancel
+                try:
+                    while True:
+                        msg = await ws.receive()
+                        if msg.get("type") == "websocket.disconnect":
+                            cancel_event.set()
+                            break
+                        if "text" in msg and msg["text"]:
+                            try:
+                                data = json.loads(msg["text"])
+                            except Exception:
+                                # Treat raw text as delta
+                                await tts.send(str(msg["text"]))
+                                continue
+
+                            typ = data.get("type")
+                            if typ == "delta":
+                                segment = data.get("text") or ""
+                                if segment:
+                                    await tts.send(segment)
+                            elif typ == "eos":
+                                await tts.send(TTSClientEosMessage())
+                                # do not break; let TTS drain
+                            elif typ == "cancel":
+                                cancel_event.set()
+                                break
+                            else:
+                                # legacy {"text": "..."} or {"input": "..."}
+                                segment = data.get("text") or data.get("input") or ""
+                                if segment:
+                                    await tts.send(segment)
+                        # ignore client binary
+                except WebSocketDisconnect:
+                    cancel_event.set()
+
+            async def pump_tts_to_ws() -> None:
+                nonlocal frames
+                try:
+                    async for msg in tts:
+                        if cancel_event.is_set():
+                            break
+                        if isinstance(msg, TTSAudioMessage):
+                            pcm = np.asarray(msg.pcm, dtype=np.float32)
+                            pcm = np.clip(pcm, -1.0, 1.0)
+                            pcm_i16 = (pcm * 32767.0).astype(np.int16)
+                            await ws.send_bytes(pcm_i16.tobytes())
+                            frames += len(pcm_i16)
+                finally:
+                    await tts.shutdown()
+
+            ws_task = asyncio.create_task(pump_ws_to_tts())
+            tts_task = asyncio.create_task(pump_tts_to_ws())
+
+            # Wait for TTS to finish (or be canceled)
+            await tts_task
+
+            if frames == 0 and not cancel_event.is_set():
                 await ws.send_json(
                     {
                         "type": "error",
@@ -264,15 +339,21 @@ def create_app() -> FastAPI:
                 )
             else:
                 await ws.send_json({"type": "eos"})
-            await ws.close()
+            # Close the websocket to unblock the reader task gracefully
+            with contextlib.suppress(Exception):
+                await ws.close()
+            # Ensure the reader finishes (it should see WebSocketDisconnect)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await ws_task
         except WebSocketDisconnect:
             logger.info("TTS bridge: client disconnected from stream")
+        except asyncio.CancelledError:
+            # Task was canceled; treat as normal shutdown for this connection
+            logger.info("TTS bridge: stream task canceled")
         except Exception as e:  # noqa: BLE001
             logger.exception("TTS bridge: stream error: %s", repr(e))
             try:
-                await ws.send_json(
-                    {"type": "error", "detail": f"{e.__class__.__name__}: {e}"}
-                )
+                await ws.send_json({"type": "error", "detail": f"{e.__class__.__name__}: {e}"})
             except Exception:  # noqa: BLE001
                 pass
             try:

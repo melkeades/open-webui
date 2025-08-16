@@ -127,7 +127,8 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
 
         faster_whisper_kwargs = {
             "model_size_or_path": model,
-            "device": DEVICE_TYPE if DEVICE_TYPE and DEVICE_TYPE == "cuda" else "cpu",
+            "device": "cuda",
+            # "device": DEVICE_TYPE if DEVICE_TYPE and DEVICE_TYPE == "cuda" else "cpu",
             "compute_type": "int8",
             "download_root": WHISPER_MODEL_DIR,
             "local_files_only": not auto_update,

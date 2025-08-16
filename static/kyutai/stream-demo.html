@@ -46,27 +46,47 @@
       >Text
       <textarea id="text" rows="4">Hello from Kyutai Unmute TTS streaming bridge!</textarea>
     </label>
+    <label>
+      Hold open (live deltas)
+      <input id="holdOpen" type="checkbox" />
+    </label>
     <button id="start">Stream & Play</button>
+    <button id="stop">Stop</button>
     <div class="log" id="log"></div>
 
     <script>
       const log = (m) => (document.getElementById('log').textContent += `\n${m}`)
 
       const startBtn = document.getElementById('start')
+      const stopBtn = document.getElementById('stop')
+      let ws = null
+      let audioCtx = null
+
+      const closeStream = () => {
+        try { ws?.send(JSON.stringify({ type: 'eos' })) } catch {}
+        try { ws?.close() } catch {}
+        try { audioCtx?.close() } catch {}
+        ws = null
+        audioCtx = null
+      }
+
+      stopBtn.onclick = () => closeStream()
+
       startBtn.onclick = async () => {
         const url = document.getElementById('wsUrl').value.trim()
         const text = document.getElementById('text').value.trim()
         const voice = document.getElementById('voice').value.trim()
+        const holdOpen = document.getElementById('holdOpen').checked
 
         if (!text) {
           log('Missing text')
           return
         }
 
-        const ws = new WebSocket(url)
+  ws = new WebSocket(url)
         ws.binaryType = 'arraybuffer'
 
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 })
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000, latencyHint: 'interactive' })
         const sampleRate = 24000
 
         if (audioCtx.state === 'suspended') {
@@ -99,7 +119,7 @@
 
         ws.onopen = () => {
           log('WS open')
-          ws.send(JSON.stringify({ input: text, ...(voice && { voice }) }))
+          ws.send(JSON.stringify({ input: text, ...(voice && { voice }), hold_open: holdOpen }))
         }
 
         ws.onmessage = async (evt) => {
@@ -140,7 +160,7 @@
           queueChunk(float32)
         }
 
-        ws.onclose = () => log('WS closed')
+  ws.onclose = () => log('WS closed')
         ws.onerror = (e) => log('WS error: ' + e.message)
       }
     </script>

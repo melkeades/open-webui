@@ -1253,14 +1253,14 @@
 						navigator.vibrate(5);
 					}
 
-					// Emit chat event for TTS
+					// Emit chat event for TTS (more frequent)
 					const messageContentParts = getMessageContentParts(
 						removeAllDetails(message.content),
 						$config?.audio?.tts?.split_on ?? 'punctuation'
 					);
 					messageContentParts.pop();
 
-					// dispatch only last sentence and make sure it hasn't been dispatched before
+					// dispatch only last part and ensure no duplicates
 					if (
 						messageContentParts.length > 0 &&
 						messageContentParts[messageContentParts.length - 1] !== message.lastSentence
@@ -1270,7 +1270,7 @@
 							new CustomEvent('chat', {
 								detail: {
 									id: message.id,
-									content: messageContentParts[messageContentParts.length - 1]
+									content: message.lastSentence
 								}
 							})
 						);

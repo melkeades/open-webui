@@ -457,6 +457,11 @@
 			}
 			stopCurrentStream = null;
 		}
+
+		// Close persistent Kyutai stream if present
+		try {
+			kyutaiCloseStream();
+		} catch {}
 	};
 
 	let audioAbortController = new AbortController();
@@ -628,6 +633,105 @@
 		});
 	};
 
+// ---- Persistent Kyutai hold_open stream ----
+let kyutaiWS: WebSocket | null = null;
+let kyutaiAudioCtx: AudioContext | null = null;
+let kyutaiNextStart = 0;
+let kyutaiEnabled = false;
+
+const isKyutaiEnabled = () => {
+	const ttsBaseUrl = /** @type {any} */ ($config?.audio?.tts)?.['openai_api_base_url'];
+	return $config?.audio?.tts?.engine === 'openai' && typeof ttsBaseUrl === 'string' && ttsBaseUrl.length > 0;
+};
+
+const kyutaiStartStream = async () => {
+	if (kyutaiWS) return;
+	const ttsBaseUrl = /** @type {any} */ ($config?.audio?.tts)?.['openai_api_base_url'];
+	let wsUrl = '';
+	try {
+		const u = new URL(ttsBaseUrl);
+		u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+		wsUrl = `${u.toString().replace(/\/?$/, '')}/audio/speech/stream`;
+	} catch (e) {
+		console.error('Invalid TTS base URL for Kyutai stream', e);
+		return;
+	}
+
+	const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
+	kyutaiAudioCtx = new AC({ sampleRate: 24000, latencyHint: 'interactive' });
+	if (kyutaiAudioCtx.state === 'suspended') {
+		try { await kyutaiAudioCtx.resume(); } catch (e) { console.error('AudioContext resume failed', e); }
+	}
+	kyutaiNextStart = kyutaiAudioCtx.currentTime;
+
+	kyutaiWS = new WebSocket(wsUrl);
+	kyutaiWS.binaryType = 'arraybuffer';
+
+	const voice =
+		$settings?.audio?.tts?.defaultVoice === $config.audio.tts.voice
+			? ($settings?.audio?.tts?.voice ?? $config?.audio?.tts?.voice)
+			: $config?.audio?.tts?.voice;
+
+	kyutaiWS.onopen = () => {
+		try { kyutaiWS?.send(JSON.stringify({ hold_open: true, ...(voice ? { voice } : {}), text: '' })); } catch {}
+	};
+
+	kyutaiWS.onmessage = async (evt) => {
+		if (typeof evt.data === 'string') {
+			try {
+				const msg = JSON.parse(evt.data);
+				if (msg.type === 'eos') {
+					// natural end
+			  assistantSpeaking = false;
+					kyutaiCloseStream();
+				}
+			} catch {}
+			return;
+		}
+		if (!kyutaiAudioCtx) return;
+		let ab: ArrayBuffer;
+		if (evt.data instanceof ArrayBuffer) ab = evt.data; else if (evt.data instanceof Blob) ab = await evt.data.arrayBuffer(); else return;
+		const buf = new Int16Array(ab);
+		const float32 = new Float32Array(buf.length);
+		for (let i = 0; i < buf.length; i++) float32[i] = Math.max(-1, Math.min(1, buf[i] / 32767));
+		try {
+			const audioBuffer = kyutaiAudioCtx.createBuffer(1, float32.length, 24000);
+			audioBuffer.copyToChannel(float32, 0);
+			const src = kyutaiAudioCtx.createBufferSource();
+			src.buffer = audioBuffer;
+			src.connect(kyutaiAudioCtx.destination);
+			const startAt = Math.max(kyutaiAudioCtx.currentTime, kyutaiNextStart);
+			src.start(startAt);
+			kyutaiNextStart = startAt + audioBuffer.duration;
+		} catch (e) { console.error('Playback error', e); }
+	};
+
+		kyutaiWS.onerror = () => {};
+		kyutaiWS.onclose = () => {
+			assistantSpeaking = false;
+			kyutaiEnabled = false;
+		};
+};
+
+const kyutaiSendDelta = (text: string) => {
+	if (!kyutaiWS || kyutaiWS.readyState !== WebSocket.OPEN) return;
+	if (!text) return;
+	try { kyutaiWS.send(JSON.stringify({ type: 'delta', text })); } catch (e) { console.error(e); }
+};
+
+const kyutaiSendEos = () => {
+	if (!kyutaiWS || kyutaiWS.readyState !== WebSocket.OPEN) return;
+	try { kyutaiWS.send(JSON.stringify({ type: 'eos' })); } catch {}
+};
+
+function kyutaiCloseStream() {
+	try { kyutaiWS?.send(JSON.stringify({ type: 'cancel' })); } catch {}
+	try { kyutaiWS?.close(); } catch {}
+	kyutaiWS = null;
+	try { kyutaiAudioCtx?.close(); } catch {}
+	kyutaiAudioCtx = null;
+}
+
 	const monitorAndPlayAudio = async (id, signal) => {
 		while (!signal.aborted) {
 			if (messages[id] && messages[id].length > 0) {
@@ -708,8 +812,14 @@
 			audioAbortController = new AbortController();
 
 			assistantSpeaking = true;
-			// Start monitoring and playing audio for the message ID
-			monitorAndPlayAudio(id, audioAbortController.signal);
+			// Kyutai hold_open: start single persistent stream
+			kyutaiEnabled = isKyutaiEnabled();
+			if (kyutaiEnabled) {
+				await kyutaiStartStream();
+			} else {
+				// Start monitoring and playing audio for the message ID (legacy per-sentence)
+				monitorAndPlayAudio(id, audioAbortController.signal);
+			}
 		}
 	};
 
@@ -723,18 +833,21 @@
 		if (currentMessageId === id) {
 			console.log(`Received chat event for message ID ${id}: ${content}`);
 
-			try {
-				if (messages[id] === undefined) {
-					messages[id] = [content];
-				} else {
-					messages[id].push(content);
+			if (kyutaiEnabled) {
+				// For persistent Kyutai, treat this as a delta chunk (may be full sentence)
+				kyutaiSendDelta(content);
+			} else {
+				try {
+					if (messages[id] === undefined) {
+						messages[id] = [content];
+					} else {
+						messages[id].push(content);
+					}
+					console.log(content);
+					fetchAudio(content);
+				} catch (error) {
+					console.error('Failed to fetch or play audio:', error);
 				}
-
-				console.log(content);
-
-				fetchAudio(content);
-			} catch (error) {
-				console.error('Failed to fetch or play audio:', error);
 			}
 		}
 	};
@@ -745,6 +858,11 @@
 		finishedMessages[id] = true;
 
 		chatStreaming = false;
+		if (kyutaiEnabled) {
+			kyutaiSendEos();
+		assistantSpeaking = false;
+		kyutaiEnabled = false;
+		}
 	};
 
 	onMount(async () => {
@@ -783,6 +901,14 @@
 		eventTarget.addEventListener('chat:start', chatStartHandler);
 		eventTarget.addEventListener('chat', chatEventHandler);
 		eventTarget.addEventListener('chat:finish', chatFinishHandler);
+		// Receive optional high-frequency deltas
+		eventTarget.addEventListener('chat:delta', (ev: any) => {
+			if (!kyutaiEnabled) return;
+			const { id, content } = ev.detail || {};
+			if (currentMessageId === id && content) {
+				kyutaiSendDelta(content);
+			}
+		});
 
 		return async () => {
 			await stopAllAudio();
