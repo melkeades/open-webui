@@ -1662,6 +1662,8 @@ async def get_app_config(request: Request):
                         "engine": app.state.config.TTS_ENGINE,
                         "voice": app.state.config.TTS_VOICE,
                         "split_on": app.state.config.TTS_SPLIT_ON,
+                        # Expose the TTS base URL so clients can derive streaming endpoints (e.g., Kyutai bridge)
+                        "openai_api_base_url": app.state.config.TTS_OPENAI_API_BASE_URL,
                     },
                     "stt": {
                         "engine": app.state.config.STT_ENGINE,

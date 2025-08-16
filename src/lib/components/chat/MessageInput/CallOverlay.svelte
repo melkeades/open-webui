@@ -447,6 +447,16 @@
 			audioElement.pause();
 			audioElement.currentTime = 0;
 		}
+
+		// Stop any active Kyutai streaming playback
+		if (stopCurrentStream) {
+			try {
+				stopCurrentStream();
+			} catch (e) {
+				console.error(e);
+			}
+			stopCurrentStream = null;
+		}
 	};
 
 	let audioAbortController = new AbortController();
@@ -481,21 +491,31 @@
 						audioCache.set(content, new Audio(blob));
 					}
 				} else if ($config.audio.tts.engine !== '') {
-					const res = await synthesizeOpenAISpeech(
-						localStorage.token,
-						$settings?.audio?.tts?.defaultVoice === $config.audio.tts.voice
-							? ($settings?.audio?.tts?.voice ?? $config?.audio?.tts?.voice)
-							: $config?.audio?.tts?.voice,
-						content
-					).catch((error) => {
-						console.error(error);
-						return null;
-					});
+					// Prefer Kyutai bridge WS streaming when configured via OpenAI-compatible base URL
+					const ttsBaseUrl = /** @type {any} */ ($config?.audio?.tts)?.['openai_api_base_url'];
+					const useKyutaiStream =
+						$config?.audio?.tts?.engine === 'openai' && typeof ttsBaseUrl === 'string' && ttsBaseUrl.length > 0;
 
-					if (res) {
-						const blob = await res.blob();
-						const blobUrl = URL.createObjectURL(blob);
-						audioCache.set(content, new Audio(blobUrl));
+					if (useKyutaiStream) {
+						// Mark as ready; playback will open a WS and stream on the fly
+						audioCache.set(content, true);
+					} else {
+						const res = await synthesizeOpenAISpeech(
+							localStorage.token,
+							$settings?.audio?.tts?.defaultVoice === $config.audio.tts.voice
+								? ($settings?.audio?.tts?.voice ?? $config?.audio?.tts?.voice)
+								: $config?.audio?.tts?.voice,
+							content
+						).catch((error) => {
+							console.error(error);
+							return null;
+						});
+
+						if (res) {
+							const blob = await res.blob();
+							const blobUrl = URL.createObjectURL(blob);
+							audioCache.set(content, new Audio(blobUrl));
+						}
 					}
 				} else {
 					audioCache.set(content, true);
@@ -509,6 +529,104 @@
 	};
 
 	let messages = {};
+
+	let stopCurrentStream: null | (() => void) = null;
+
+	const kyutaiStreamPlay = async (text: string) => {
+		const ttsBaseUrl = /** @type {any} */ ($config?.audio?.tts)?.['openai_api_base_url'];
+		const voice =
+			$settings?.audio?.tts?.defaultVoice === $config.audio.tts.voice
+				? ($settings?.audio?.tts?.voice ?? $config?.audio?.tts?.voice)
+				: $config?.audio?.tts?.voice;
+
+		let wsUrl = '';
+		try {
+			const u = new URL(ttsBaseUrl);
+			u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+			const base = u.toString().replace(/\/?$/, '');
+			wsUrl = `${base}/audio/speech/stream`;
+		} catch (e) {
+			console.error('Invalid TTS base URL for Kyutai stream', e);
+			return;
+		}
+
+		const AC = (window as any).AudioContext || (window as any).webkitAudioContext;
+		const audioCtx = new AC({ sampleRate: 24000 });
+		if (audioCtx.state === 'suspended') {
+			try {
+				await audioCtx.resume();
+			} catch (e) {
+				console.error('Failed to resume AudioContext', e);
+			}
+		}
+
+		let nextStartTime = audioCtx.currentTime;
+		let closed = false;
+		const queueChunk = (float32: Float32Array) => {
+			if (closed) return;
+			try {
+				const audioBuffer = audioCtx.createBuffer(1, float32.length, 24000);
+				audioBuffer.copyToChannel(float32, 0);
+				const src = audioCtx.createBufferSource();
+				src.buffer = audioBuffer;
+				src.connect(audioCtx.destination);
+				const startAt = Math.max(audioCtx.currentTime, nextStartTime);
+				src.start(startAt);
+				nextStartTime = startAt + audioBuffer.duration;
+			} catch (e) {
+				console.error('Playback error', e);
+			}
+		};
+
+		const ws = new WebSocket(wsUrl);
+		ws.binaryType = 'arraybuffer';
+
+		stopCurrentStream = () => {
+			closed = true;
+			try {
+				ws.close();
+			} catch {}
+			try {
+				audioCtx.close();
+			} catch {}
+		};
+
+		await new Promise<void>((resolve) => {
+			ws.onopen = () => {
+				try {
+					ws.send(JSON.stringify({ input: text, ...(voice ? { voice } : {}) }));
+				} catch (e) {
+					console.error('Failed to send WS init', e);
+				}
+			};
+			ws.onmessage = async (evt) => {
+				if (typeof evt.data === 'string') {
+					try {
+						const msg = JSON.parse(evt.data);
+						if (msg.type === 'eos') {
+							resolve();
+							ws.close();
+						}
+					} catch {}
+					return;
+				}
+				let ab: ArrayBuffer;
+				if (evt.data instanceof ArrayBuffer) ab = evt.data;
+				else if (evt.data instanceof Blob) ab = await evt.data.arrayBuffer();
+				else return;
+				const buf = new Int16Array(ab);
+				const float32 = new Float32Array(buf.length);
+				for (let i = 0; i < buf.length; i++) float32[i] = Math.max(-1, Math.min(1, buf[i] / 32767));
+				queueChunk(float32);
+			};
+			ws.onerror = () => {
+				resolve();
+			};
+			ws.onclose = () => {
+				resolve();
+			};
+		});
+	};
 
 	const monitorAndPlayAudio = async (id, signal) => {
 		while (!signal.aborted) {
@@ -527,19 +645,32 @@
 					}
 
 					if ($config.audio.tts.engine !== '') {
-						try {
-							console.log(
-								'%c%s',
-								'color: red; font-size: 20px;',
-								`Playing audio for content: ${content}`
-							);
+						const ttsBaseUrl = /** @type {any} */ ($config?.audio?.tts)?.['openai_api_base_url'];
+						const useKyutaiStream =
+							$config?.audio?.tts?.engine === 'openai' && typeof ttsBaseUrl === 'string' && ttsBaseUrl.length > 0;
 
-							const audio = audioCache.get(content);
-							await playAudio(audio); // Here ensure that playAudio is indeed correct method to execute
-							console.log(`Played audio for content: ${content}`);
-							await new Promise((resolve) => setTimeout(resolve, 200)); // Wait before retrying to reduce tight loop
-						} catch (error) {
-							console.error('Error playing audio:', error);
+						if (useKyutaiStream) {
+							try {
+								await kyutaiStreamPlay(content);
+							} catch (error) {
+								console.error('Streaming playback error:', error);
+							}
+							await new Promise((resolve) => setTimeout(resolve, 50));
+						} else {
+							try {
+								console.log(
+									'%c%s',
+									'color: red; font-size: 20px;',
+									`Playing audio for content: ${content}`
+								);
+
+								const audio = audioCache.get(content);
+								await playAudio(audio); // Here ensure that playAudio is indeed correct method to execute
+								console.log(`Played audio for content: ${content}`);
+								await new Promise((resolve) => setTimeout(resolve, 200)); // Wait before retrying to reduce tight loop
+							} catch (error) {
+								console.error('Error playing audio:', error);
+							}
 						}
 					} else {
 						await speakSpeechSynthesisHandler(content);
